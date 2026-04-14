@@ -1,0 +1,67 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.installed.cfg
+MANIFEST
+
+# ── Virtual environments / uv ─────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ── uv ────────────────────────────────────────────────────────────────────────
+# uv.lock is intentionally committed; do not add it here.
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+*.pem
+*.key
+
+# ── Testing / coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# ── Type checkers ─────────────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+.pyre/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── ML artifacts (generated; not committed) ───────────────────────────────────
+app/artifacts/v1/model.joblib
+app/artifacts/v1/label_encoder.joblib
+app/artifacts/v1/metadata.json
+app/artifacts/v1/disease_info.json
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ── Alembic generated ─────────────────────────────────────────────────────────
+# Keep alembic/versions/ in source control.
+
+# ── Legacy venv (the one committed in error) ──────────────────────────────────
+Include/
+Scripts/
+Lib/
+share/
+etc/
+pyvenv.cfg

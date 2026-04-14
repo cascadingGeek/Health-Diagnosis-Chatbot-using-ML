@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "health-diagnosis-chatbot"
+version = "1.0.0"
+description = "ML-based health symptom diagnosis chatbot using Decision Tree"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "sqlalchemy[asyncio]>=2.0",
+  "asyncpg>=0.29",
+  "alembic>=1.13",
+  "scikit-learn>=1.4",
+  "numpy>=1.26",
+  "joblib>=1.3",
+  "python-dotenv>=1.0",
+  "rapidfuzz>=3.6",
+  "psycopg2-binary>=2.9",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "httpx>=0.27",
+  "pytest-cov",
+  "pandas>=3.0.2",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
