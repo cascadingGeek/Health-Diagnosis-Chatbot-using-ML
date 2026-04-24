@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     confidence_threshold: float = 0.60
 
     # ── CORS ──────────────────────────────────────────────────────────────────
-    cors_origins: str = "*"
+    cors_origins: list[str] = ["*"]
 
     @field_validator("cors_origins", mode="before")
     @classmethod
