@@ -33,9 +33,9 @@ class Settings(BaseSettings):
     confidence_threshold: float = 0.60
 
     # ── CORS ──────────────────────────────────────────────────────────────────
-    allowed_origins: list[str] = ["http://localhost:3000"]
+    cors_origins: str
 
-    @field_validator("allowed_origins", mode="before")
+    @field_validator("cors_origins", mode="before")
     @classmethod
     def _parse_origins(cls, v: object) -> list[str]:
         """Allow a comma-separated string or a list."""

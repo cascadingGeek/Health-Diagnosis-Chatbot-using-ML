@@ -1,7 +1,7 @@
 """CORS middleware configuration.
 
 Imported by ``app/main.py`` and applied to the FastAPI application.
-Allowed origins are read from ``settings.allowed_origins`` so there are no
+Allowed origins are read from ``settings.cors_origins`` so there are no
 hardcoded URLs.
 """
 
@@ -19,7 +19,7 @@ def add_cors_middleware(app: FastAPI) -> None:
     """
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.allowed_origins,
+        allow_origins=settings.cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
