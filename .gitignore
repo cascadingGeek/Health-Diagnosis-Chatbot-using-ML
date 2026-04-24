@@ -42,11 +42,8 @@ coverage.xml
 # ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 
-# ── ML artifacts (generated; not committed) ───────────────────────────────────
-app/artifacts/v1/model.joblib
-app/artifacts/v1/label_encoder.joblib
-app/artifacts/v1/metadata.json
-app/artifacts/v1/disease_info.json
+# ── ML artifacts ──────────────────────────────────────────────────────────────
+# Committed intentionally — files are small (<100 KB) and needed at runtime.
 
 # ── OS / editor ───────────────────────────────────────────────────────────────
 .DS_Store
