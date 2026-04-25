@@ -33,15 +33,7 @@ class Settings(BaseSettings):
     confidence_threshold: float = 0.60
 
     # ── CORS ──────────────────────────────────────────────────────────────────
-    cors_origins: list[str] = ["*"]
-
-    @field_validator("cors_origins", mode="before")
-    @classmethod
-    def _parse_origins(cls, v: object) -> list[str]:
-        """Allow a comma-separated string or a list."""
-        if isinstance(v, str):
-            return [o.strip() for o in v.split(",") if o.strip()]
-        return v  # type: ignore[return-value]
+    cors_origins: str = "*"
 
     @field_validator("confidence_threshold")
     @classmethod
