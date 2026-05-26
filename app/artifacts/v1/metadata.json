@@ -176,7 +176,8 @@
     "Varicose veins",
     "hepatitis A"
   ],
-  "model_version": "1.0.0",
+  "model_version": "2.0.0",
   "accuracy": 1.0,
-  "cv_mean_accuracy": 1.0
+  "cv_mean_accuracy": 1.0,
+  "cv_std_accuracy": 0.0
 }

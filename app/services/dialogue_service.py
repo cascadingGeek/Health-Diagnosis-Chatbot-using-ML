@@ -11,6 +11,16 @@ DONE       → Bot offers restart / feedback.
 All mutable state is stored in the ``ChatSession`` ORM object passed in from
 the controller.  This service is fully stateless and never holds module-level
 mutable data.
+
+Changes vs. v1
+--------------
+- COLLECTING state now routes follow-up questions through ``symptom_router``
+  based on the user's primary symptom, replacing the previous approach of
+  iterating the full 132-symptom list in training-data order.
+- Session tracks ``primary_symptom``, ``followup_queue``, and
+  ``denied_symptoms`` in addition to the existing fields.
+- Yes/no questions use ``question_templates.get_question()`` for natural prose
+  instead of raw token strings.
 """
 
 from __future__ import annotations
@@ -22,6 +32,8 @@ from typing import TYPE_CHECKING
 from rapidfuzz import process as rfprocess
 
 from app.core.exceptions import FeatureContractError, InconclusiveDiagnosisError
+from app.core.question_templates import get_question
+from app.core.symptom_router import get_followup_questions
 from app.ml.feature_builder import _normalise  # reuse normalisation logic
 from app.ml.model_registry import ModelRegistry
 from app.schemas.diagnosis import DiagnosisResult
@@ -36,7 +48,7 @@ logger = logging.getLogger(__name__)
 # Minimum confirmed symptoms before collection can stop.
 _MIN_CONFIRMED: int = 3
 # Maximum yes/no questions asked per session.
-_MAX_QUESTIONS: int = 10
+_MAX_QUESTIONS: int = 8
 # Fuzzy match threshold for the user's free-text primary symptom input.
 _PRIMARY_FUZZY_THRESHOLD: float = 60.0
 
@@ -143,20 +155,21 @@ def _handle_collecting(
     """Process a user reply in the COLLECTING state.
 
     If no symptoms have been confirmed yet, treat the message as the user's
-    primary symptom (free-text → fuzzy match).  Otherwise treat it as a
-    yes/no answer to the last question.
+    primary symptom (free-text → fuzzy match) and build a clinically relevant
+    follow-up question queue via ``symptom_router``.  Otherwise treat the
+    message as a yes/no answer to the last question.
 
     Args:
         session:      Current session (mutated in-place).
         user_message: User's raw text.
-        registry:     Used to obtain the canonical symptom list.
+        registry:     Used to obtain the canonical symptom list and model.
 
     Returns:
         TurnResult with the next yes/no question or confirmation prompt.
     """
     symptom_list = registry.get_symptom_list()
-    confirmed: list[str] = list(session.confirmed_symptoms)
-    asked: list[str] = list(session.asked_symptoms)
+    confirmed: list[str] = list(session.confirmed_symptoms or [])
+    asked: list[str] = list(session.asked_symptoms or [])
 
     # ── Branch A: no confirmed symptoms yet — parse primary symptom ──────────
     if not confirmed:
@@ -167,86 +180,109 @@ def _handle_collecting(
                 "Could you rephrase it? For example: 'fever', 'cough', "
                 "'chest pain', 'fatigue'."
             )
+
         confirmed.append(matched)
         asked.append(matched)
         session.confirmed_symptoms = confirmed
         session.asked_symptoms = asked
+        session.primary_symptom = matched
 
-        # Ask the first candidate symptom right away.
-        return _ask_next_or_confirm(session, symptom_list, confirmed, asked)
+        # Build the clinically relevant follow-up queue for this primary symptom.
+        model = registry.get_model()
+        queue = get_followup_questions(
+            primary_symptom=matched,
+            already_asked=asked,
+            symptom_list=symptom_list,
+            model=model,
+            max_questions=_MAX_QUESTIONS,
+        )
+        session.followup_queue = queue
+        logger.debug(
+            "Follow-up queue built",
+            extra={"primary": matched, "queue": queue},
+        )
+
+        return _ask_next_or_confirm(session, confirmed, asked)
 
     # ── Branch B: parse yes/no answer ─────────────────────────────────────────
     answer = _parse_yes_no(user_message)
     if answer is None:
-        # Last asked symptom is the one awaiting a yes/no.
         last_asked = asked[-1] if asked else "this symptom"
+        q = get_question(last_asked)
         return TurnResult(
-            f"Sorry, I didn't catch that. "
-            f"Do you have **{last_asked.replace('_', ' ')}**? "
-            "Please answer **yes** or **no**."
+            f"Sorry, I didn't catch that. {q} Please answer **yes** or **no**."
         )
 
-    if answer is True:
-        # The last asked symptom (which isn't the primary) was confirmed.
-        # The last entry of `asked` is the symptom we just asked about.
-        last_candidate = asked[-1]
-        if last_candidate not in confirmed:
-            confirmed.append(last_candidate)
-            session.confirmed_symptoms = confirmed
+    last_candidate = asked[-1] if asked else None
 
-    session.asked_symptoms = asked  # already up-to-date
+    if answer is True and last_candidate and last_candidate not in confirmed:
+        confirmed.append(last_candidate)
+        session.confirmed_symptoms = confirmed
+    elif answer is False and last_candidate:
+        denied: list[str] = list(session.denied_symptoms or [])
+        if last_candidate not in denied:
+            denied.append(last_candidate)
+            session.denied_symptoms = denied
 
-    return _ask_next_or_confirm(session, symptom_list, confirmed, asked)
+    return _ask_next_or_confirm(session, confirmed, asked)
 
 
 def _ask_next_or_confirm(
     session: "ChatSession",
-    symptom_list: list[str],
     confirmed: list[str],
     asked: list[str],
 ) -> TurnResult:
-    """Either ask the next candidate symptom or transition to CONFIRMING.
+    """Either ask the next symptom from the follow-up queue or move to CONFIRMING.
+
+    Pops the next symptom token from ``session.followup_queue``.  Transitions
+    to CONFIRMING when the queue is empty or the question cap is reached.
 
     Args:
-        session:      Current session (mutated in-place).
-        symptom_list: Full canonical symptom list.
-        confirmed:    Symptoms confirmed so far.
-        asked:        Symptoms already presented to the user.
+        session:   Current session (mutated in-place).
+        confirmed: Symptoms confirmed so far this session.
+        asked:     Symptoms already presented to the user.
 
     Returns:
         TurnResult with the next question or the confirmation prompt.
     """
-    questions_asked = len(asked) - 1  # subtract the primary symptom
-    remaining = [s for s in symptom_list if s not in asked]
+    # questions_asked excludes the primary symptom itself.
+    questions_asked = len(asked) - 1
+    followup_queue: list[str] = list(session.followup_queue or [])
 
+    queue_empty = not followup_queue
+    at_limit = questions_asked >= _MAX_QUESTIONS
     enough_confirmed = len(confirmed) >= _MIN_CONFIRMED
-    no_more_questions = not remaining or questions_asked >= _MAX_QUESTIONS
 
-    if enough_confirmed and no_more_questions:
+    should_stop = queue_empty or at_limit
+
+    if should_stop:
         session.state = DialogueState.CONFIRMING
-        names = ", ".join(s.replace("_", " ") for s in confirmed)
+        if confirmed:
+            names = ", ".join(s.replace("_", " ") for s in confirmed)
+            if enough_confirmed:
+                return TurnResult(
+                    f"Based on your responses I've noted the following symptoms:\n"
+                    f"**{names}**\n\n"
+                    "Is that correct? (yes / no)"
+                )
+            return TurnResult(
+                f"I've gone through all available questions. You confirmed:\n"
+                f"**{names}**\n\nIs that correct? (yes / no)"
+            )
+        # Edge case: only the primary symptom confirmed and queue was empty.
+        names = (confirmed[0].replace("_", " ") if confirmed else "none")
         return TurnResult(
-            f"Based on your responses I've noted the following symptoms:\n"
-            f"**{names}**\n\n"
-            "Is that correct? (yes / no)"
+            f"You've reported: **{names}**\n\nIs that correct? (yes / no)"
         )
 
-    if not remaining:
-        # Ran out of candidates without 3 confirmed — proceed anyway.
-        session.state = DialogueState.CONFIRMING
-        names = ", ".join(s.replace("_", " ") for s in confirmed) or "none"
-        return TurnResult(
-            f"I've gone through all available symptoms. You confirmed:\n"
-            f"**{names}**\n\nIs that correct? (yes / no)"
-        )
-
-    # Pick the next candidate and add it to asked.
-    next_symptom = remaining[0]
+    # Pop the next symptom from the queue and ask about it.
+    next_symptom = followup_queue.pop(0)
+    session.followup_queue = followup_queue
     asked.append(next_symptom)
     session.asked_symptoms = asked
 
-    readable = next_symptom.replace("_", " ")
-    return TurnResult(f"Do you have **{readable}**? (yes / no)")
+    question = get_question(next_symptom)
+    return TurnResult(question)
 
 
 def _handle_confirming(
@@ -257,7 +293,7 @@ def _handle_confirming(
     """Process yes/no confirmation of the collected symptom list.
 
     yes → PREDICTING (run inference immediately).
-    no  → reset and return to COLLECTING.
+    no  → reset all collection state and return to COLLECTING.
 
     Args:
         session:      Current session (mutated in-place).
@@ -278,9 +314,12 @@ def _handle_confirming(
         )
 
     if answer is False:
-        # Reset collection
+        # Reset all collection state so the user can start over.
         session.confirmed_symptoms = []
         session.asked_symptoms = []
+        session.followup_queue = []
+        session.denied_symptoms = []
+        session.primary_symptom = None
         session.state = DialogueState.COLLECTING
         return TurnResult(
             "No problem! Let's start again. "
@@ -357,7 +396,6 @@ def _handle_done(session: "ChatSession", user_message: str) -> TurnResult:
         TurnResult guiding the user to restart or submit feedback.
     """
     if "restart" in user_message.lower():
-        # Controller will create a new session; instruct user.
         return TurnResult(
             "To start a new session, simply send a new message without a "
             "session_id, or refresh the page."

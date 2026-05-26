@@ -5,10 +5,6 @@ Creates and configures the FastAPI application:
   - Registers middleware (CORS, rate limiting).
   - Mounts all v1 routers under ``/api/v1``.
   - Exposes a ``/health`` liveness probe.
-
-Run with::
-
-    uv run -m app.main
 """
 
 from fastapi import FastAPI

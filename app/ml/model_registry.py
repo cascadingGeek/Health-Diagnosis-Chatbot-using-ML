@@ -22,6 +22,7 @@ from app.core.exceptions import ArtifactLoadError, ModelNotInitialisedError
 logger = logging.getLogger(__name__)
 
 _REQUIRED_FILES = ("model.joblib", "label_encoder.joblib", "metadata.json")
+_OPTIONAL_FILES = ("disease_info.json", "feature_importance.json")
 
 
 class ModelRegistry:
@@ -37,6 +38,7 @@ class ModelRegistry:
         self._symptom_list: list[str] | None = None
         self._metadata: dict[str, Any] | None = None
         self._disease_info: dict[str, Any] | None = None
+        self._feature_importance: dict[str, float] | None = None
         self._initialised: bool = False
 
     def load(self, artifacts_dir: Path) -> None:
@@ -84,6 +86,31 @@ class ModelRegistry:
                 self._disease_info = {}
         else:
             self._disease_info = {}
+
+        # feature_importance.json is optional; derive from model if absent.
+        fi_path = artifacts_dir / "feature_importance.json"
+        if fi_path.exists():
+            try:
+                with open(fi_path, encoding="utf-8") as fh:
+                    self._feature_importance = json.load(fh)
+            except Exception as exc:
+                logger.warning(
+                    "Could not load feature_importance.json — will derive from model.",
+                    extra={"error": str(exc)},
+                )
+                self._feature_importance = None
+        else:
+            self._feature_importance = None
+
+        # Derive feature importance from model if not loaded from file.
+        if self._feature_importance is None and self._model is not None:
+            import numpy as np  # noqa: PLC0415
+            importances = self._model.feature_importances_
+            self._feature_importance = {
+                sym: float(importances[i])
+                for i, sym in enumerate(self._symptom_list or [])
+            }
+            logger.debug("Feature importances derived from model weights")
 
         self._initialised = True
         logger.info(
@@ -166,6 +193,21 @@ class ModelRegistry:
         self._check()
         assert self._disease_info is not None  # noqa: S101
         return self._disease_info
+
+    def get_feature_importance(self) -> dict[str, float]:
+        """Return the symptom → Gini importance mapping.
+
+        Returns:
+            Dict mapping canonical symptom name → importance score in [0, 1].
+            Derived from ``model.feature_importances_`` if
+            ``feature_importance.json`` was not found on disk.
+
+        Raises:
+            ModelNotInitialisedError: If ``load()`` has not been called.
+        """
+        self._check()
+        assert self._feature_importance is not None  # noqa: S101
+        return self._feature_importance
 
 
 # Module-level singleton — imported and called by lifespan, then read-only.
