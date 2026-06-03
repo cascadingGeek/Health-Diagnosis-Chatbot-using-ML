@@ -22,13 +22,18 @@ This module is the single entry point called by the chat controller for every
 user message once the FSM is in COLLECTING or CONFIRMING state.
 """
 
+import json
 import logging
 from typing import TYPE_CHECKING
 
-from app.core.exceptions import FeatureContractError
+from anthropic import Anthropic
+
+from app.core.config import settings
 from app.core.llm_input_processor import extract_symptoms_from_text
-from app.core.llm_output_validator import validate_and_explain_diagnosis
+from app.core.llm_output_validator import MEDICAL_DISCLAIMER, validate_and_explain_diagnosis
 from app.services.predictor_service import predict_disease
+
+_client = Anthropic(api_key=settings.anthropic_api_key)
 
 if TYPE_CHECKING:
     from app.database.models.session_log import ChatSession
@@ -105,6 +110,17 @@ async def process_message(
                 "question",
                 "Could you tell me more about how you are feeling?",
             )
+            # Capture symptoms resolved this turn via severity/qualifier statements.
+            # These come from newly_confirmed/newly_denied in the ask action, which
+            # is separate from the generic confirmed_symptoms/denied_symptoms already
+            # merged above (those apply to extract/ready actions).
+            for s in layer1_result.get("newly_confirmed", []):
+                if s and s not in confirmed:
+                    confirmed.append(s)
+            for s in layer1_result.get("newly_denied", []):
+                if s and s not in denied:
+                    denied.append(s)
+
             history.append({"role": "assistant", "content": question})
             _update_session_collecting(
                 session, confirmed, denied, history, questions_asked + 1
@@ -127,11 +143,19 @@ async def process_message(
             return await _run_prediction(session, confirmed, denied, summary, history)
 
         if action == "extract" and len(confirmed) < 3:
-            # More symptoms needed — generate a bridging question.
-            follow_up = (
-                "Thank you for sharing that. Could you tell me more? "
-                "For example, do you have a fever, headache, or any pain anywhere?"
-            )
+            # Layer 1 extracted symptoms but did not generate a follow-up question.
+            # Use unmapped_complaints for context when available.
+            unmapped = layer1_result.get("unmapped_complaints", [])
+            if unmapped:
+                follow_up = (
+                    f"I noted you mentioned {unmapped[0]}. Could you tell me a bit more — "
+                    f"how long have you had this, and is it constant or does it come and go?"
+                )
+            else:
+                follow_up = (
+                    "Could you describe what you're feeling in a bit more detail? "
+                    "For example, how long has this been going on and how severe is it?"
+                )
             history.append({"role": "assistant", "content": follow_up})
             _update_session_collecting(
                 session, confirmed, denied, history, questions_asked + 1
@@ -143,13 +167,45 @@ async def process_message(
                 "session_state": "COLLECTING",
             }
 
-        # Unclear / unrecognised input.
+        # ── UNCLEAR — Layer 1 could not parse the user's message ───────────────
+        # Check whether we already asked for clarification on the previous turn.
+        # If so, do not loop — forward to prediction with whatever is confirmed.
+        last_assistant = next(
+            (m["content"] for m in reversed(history[:-1]) if m["role"] == "assistant"),
+            "",
+        )
+        already_asked_to_clarify = (
+            "didn't quite catch" in last_assistant.lower()
+            or "describe what you're feeling" in last_assistant.lower()
+            or "could you describe" in last_assistant.lower()
+            or "make sure i understand" in last_assistant.lower()
+        )
+
+        if already_asked_to_clarify or questions_asked >= 5 or len(confirmed) >= 3:
+            logger.info(
+                "UNCLEAR loop broken — proceeding to prediction | "
+                "confirmed=%s questions_asked=%d | session=%s",
+                confirmed, questions_asked, session_id,
+            )
+            summary = (
+                f"Patient described: "
+                f"{', '.join(confirmed) if confirmed else 'unspecified symptoms'}. "
+                f"Some responses could not be fully interpreted."
+            )
+            _update_session_collecting(
+                session, confirmed, denied, history, questions_asked
+            )
+            return await _run_prediction(session, confirmed, denied, summary, history)
+
+        # First UNCLEAR this session — ask politely once.
         follow_up = (
-            "I didn't quite catch that. Could you describe what you're feeling "
-            "in a bit more detail? You can type a full sentence."
+            "I want to make sure I understand you correctly. "
+            "Could you tell me a little more about how you are feeling?"
         )
         history.append({"role": "assistant", "content": follow_up})
-        session.conversation_history = history
+        _update_session_collecting(
+            session, confirmed, denied, history, questions_asked + 1
+        )
         return {
             "response_type": "question",
             "message": follow_up,
@@ -176,6 +232,10 @@ async def _run_prediction(
 ) -> dict:
     """Run Layer 2 (Decision Tree) then Layer 3 (Claude output validator).
 
+    Falls back to Claude web search if the Decision Tree cannot produce a
+    reliable prediction (sparse symptom vector, unknown symptoms, or low
+    confidence).
+
     Args:
         session: Active ChatSession (mutated in-place).
         confirmed: Confirmed symptom tokens.
@@ -188,56 +248,87 @@ async def _run_prediction(
     """
     session_id = str(session.id)
 
-    # ── LAYER 2: Decision Tree ───────────────────────────────────────────────
+    # ── Attempt Layer 2: Decision Tree ──────────────────────────────────────
+    dt_result = None
+    dt_failed = False
+
     try:
         dt_result = predict_disease(confirmed)
-        predicted_disease = dt_result["disease"]
-        raw_confidence = dt_result["confidence"]
-    except FeatureContractError as exc:
-        logger.error(
-            "Layer 2 feature contract error: %s | session=%s", exc, session_id
-        )
-        return _error_response(
-            "I encountered an unrecognised symptom and cannot complete the "
-            "diagnosis. Please restart and try again.",
-            session,
-        )
+        if (
+            not dt_result
+            or dt_result.get("disease") is None
+            or dt_result.get("confidence", 0) < 0.40
+        ):
+            dt_failed = True
+            logger.info(
+                "Layer 2 confidence too low or no result — routing to LLM fallback. "
+                "Confirmed symptoms: %s", confirmed
+            )
     except Exception as exc:
-        logger.error("Layer 2 prediction failed: %s | session=%s", exc, session_id)
-        return _error_response(
-            "The diagnostic model encountered an error. Please try again.", session
+        dt_failed = True
+        logger.warning(
+            "Layer 2 prediction failed: %s — routing to LLM fallback | session=%s",
+            exc, session_id,
         )
 
-    # ── LAYER 3: Claude validation + explanation ─────────────────────────────
-    layer3_result = validate_and_explain_diagnosis(
-        predicted_disease=predicted_disease,
-        raw_confidence=raw_confidence,
+    # ── Layer 2 succeeded — run Layer 3 validation ──────────────────────────
+    if not dt_failed:
+        layer3_result = validate_and_explain_diagnosis(
+            predicted_disease=dt_result["disease"],
+            raw_confidence=dt_result["confidence"],
+            confirmed_symptoms=confirmed,
+            denied_symptoms=denied,
+            conversation_summary=summary,
+            session_id=session_id,
+        )
+        session.state = "DONE"
+        session.completed = True
+        session.confirmed_symptoms = confirmed
+        session.conversation_history = history
+        session.final_diagnosis = layer3_result
+        session.predicted_disease = (
+            layer3_result.get("display_disease") or dt_result["disease"]
+        )
+        session.confidence = (
+            layer3_result.get("display_confidence") or dt_result["confidence"]
+        )
+
+        if layer3_result.get("is_plausible"):
+            return {
+                "response_type": "diagnosis",
+                "message": layer3_result["explanation"],
+                "diagnosis": layer3_result,
+                "session_state": "DONE",
+            }
+        # Layer 3 flagged the prediction as implausible — escalate to LLM fallback.
+        dt_failed = True
+        logger.info(
+            "Layer 3 flagged implausible — escalating to LLM fallback | session=%s",
+            session_id,
+        )
+
+    # ── LLM Fallback: Claude with web search ────────────────────────────────
+    logger.info(
+        "Running LLM web search fallback for symptoms: %s | session=%s",
+        confirmed, session_id,
+    )
+    fallback_result = await _llm_web_search_fallback(
         confirmed_symptoms=confirmed,
         denied_symptoms=denied,
         conversation_summary=summary,
-        session_id=session_id,
     )
-
-    # Persist final state on the session object.
     session.state = "DONE"
     session.completed = True
     session.confirmed_symptoms = confirmed
     session.conversation_history = history
-    session.final_diagnosis = layer3_result
-    session.predicted_disease = layer3_result.get("display_disease") or predicted_disease
-    session.confidence = layer3_result.get("display_confidence") or raw_confidence
+    session.final_diagnosis = fallback_result
+    session.predicted_disease = fallback_result.get("display_disease")
+    session.confidence = fallback_result.get("display_confidence")
 
-    if layer3_result.get("is_plausible"):
-        return {
-            "response_type": "diagnosis",
-            "message": layer3_result["explanation"],
-            "diagnosis": layer3_result,
-            "session_state": "DONE",
-        }
     return {
-        "response_type": "inconclusive",
-        "message": layer3_result["explanation"],
-        "diagnosis": layer3_result,
+        "response_type": "diagnosis",
+        "message": fallback_result["explanation"],
+        "diagnosis": fallback_result,
         "session_state": "DONE",
     }
 
@@ -280,4 +371,131 @@ def _error_response(message: str, session: "ChatSession") -> dict:
         "message": message,
         "diagnosis": None,
         "session_state": session.state,
+    }
+
+
+async def _llm_web_search_fallback(
+    confirmed_symptoms: list[str],
+    denied_symptoms: list[str],
+    conversation_summary: str,
+) -> dict:
+    """Call Claude with web search when the Decision Tree cannot handle the symptom cluster.
+
+    Used when the DT raises an exception, returns no result, produces confidence
+    below the 0.40 floor, or when Layer 3 flags the prediction as implausible.
+    Handles symptom clusters outside the 132-feature Kaggle vocabulary, sparse
+    vectors, and conditions not in the 41 training classes.
+
+    Args:
+        confirmed_symptoms: Symptom tokens the user confirmed.
+        denied_symptoms: Symptom tokens the user denied.
+        conversation_summary: Plain-English summary of the consultation.
+
+    Returns:
+        Diagnosis dict compatible with the Layer 3 output schema, with
+        ``source`` set to ``"web_search"``.
+    """
+    system = (
+        "You are Dr. Melvis, a warm and knowledgeable AI health assistant.\n"
+        "The patient's symptoms could not be matched to conditions in your local diagnostic\n"
+        "database. Use web search to research the symptom cluster and provide a helpful,\n"
+        "clinically grounded response.\n\n"
+        "RULES:\n"
+        "- Search for the most likely condition(s) given the symptoms\n"
+        "- Be honest that this is an AI assessment, not a professional diagnosis\n"
+        "- Give 3–5 practical precautions or next steps\n"
+        "- Always include the disclaimer\n"
+        "- Respond in warm, human, plain English — not clinical jargon\n"
+        "- Format your final answer as JSON:\n"
+        "{\n"
+        '  "is_plausible": true,\n'
+        '  "display_disease": "Most likely condition name",\n'
+        '  "display_confidence": 0.72,\n'
+        '  "urgency": "mild | moderate | urgent",\n'
+        '  "explanation": "Plain English explanation",\n'
+        '  "precautions": ["step 1", "step 2", "step 3"],\n'
+        '  "when_to_see_doctor": "Specific guidance",\n'
+        '  "source": "web_search",\n'
+        '  "disclaimer": "PASTE DISCLAIMER HERE"\n'
+        "}"
+    )
+
+    user_message = (
+        f"Patient confirmed symptoms: {confirmed_symptoms}\n"
+        f"Patient denied symptoms: {denied_symptoms}\n"
+        f"Conversation summary: {conversation_summary}\n\n"
+        f"The local diagnostic model could not handle this symptom cluster. "
+        f"Please search for the most likely condition and provide your assessment."
+    )
+
+    tools = [{"type": "web_search_20250305", "name": "web_search"}]
+
+    raw = ""
+    try:
+        response = _client.messages.create(
+            model=settings.anthropic_model,
+            max_tokens=1024,
+            system=system,
+            messages=[{"role": "user", "content": user_message}],
+            tools=tools,
+        )
+
+        logger.info(
+            "Claude API usage | model=%s input_tokens=%d output_tokens=%d layer=fallback",
+            response.model,
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+        )
+
+        text_blocks = [b for b in response.content if b.type == "text"]
+        if not text_blocks:
+            logger.warning("LLM web search fallback returned no text block")
+            return _inconclusive_fallback()
+
+        raw = text_blocks[-1].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+
+        parsed = json.loads(raw.strip())
+        parsed["disclaimer"] = MEDICAL_DISCLAIMER
+        parsed["source"] = "web_search"
+        # Enforce the 0.89 confidence ceiling.
+        if parsed.get("display_confidence", 0) > 0.89:
+            parsed["display_confidence"] = 0.89
+        return parsed
+
+    except json.JSONDecodeError as exc:
+        logger.error("LLM web search fallback JSON parse error: %s | raw=%s", exc, raw)
+        return _inconclusive_fallback()
+    except Exception as exc:
+        logger.error("LLM web search fallback failed: %s", exc)
+        return _inconclusive_fallback()
+
+
+def _inconclusive_fallback() -> dict:
+    """Safe fallback diagnosis dict when no layer can produce a result.
+
+    Returns:
+        Minimal inconclusive response with disclaimer and doctor referral.
+    """
+    return {
+        "is_plausible": False,
+        "display_disease": None,
+        "display_confidence": None,
+        "urgency": "moderate",
+        "explanation": (
+            "We were unable to determine a clear diagnosis from the symptoms described. "
+            "This may be because your symptoms match multiple conditions or fall outside "
+            "the conditions this system handles."
+        ),
+        "precautions": [
+            "Visit the nearest clinic or hospital for a proper evaluation",
+            "Describe all your symptoms to the doctor as you described them here",
+            "Do not self-medicate based on this assessment",
+        ],
+        "when_to_see_doctor": "As soon as possible",
+        "source": "inconclusive",
+        "disclaimer": MEDICAL_DISCLAIMER,
     }

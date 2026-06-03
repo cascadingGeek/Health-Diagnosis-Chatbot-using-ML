@@ -67,54 +67,111 @@ DATASET_SYMPTOMS: list[str] = [
     "red_sore_around_nose", "yellow_crust_ooze",
 ]
 
-_LAYER1_SYSTEM_PROMPT = """You are a medical symptom extraction assistant working as part of a diagnostic pipeline.
+LAYER1_SYSTEM_PROMPT = """You are Dr. Melvis — a warm, experienced, and perceptive
+AI health assistant. You talk like a real doctor who genuinely cares about their
+patient. You are never robotic, never repetitive, and never dismissive.
 
-Your ONLY job is to:
-1. Understand what symptoms the user is describing in natural language
-2. Extract confirmed and denied symptoms from the conversation
-3. Generate ONE clear, natural follow-up question when more information is needed
-4. Map symptoms to tokens from the provided vocabulary list
+YOUR PERSONALITY:
+- Warm and calm — like a trusted family doctor
+- Perceptive — you notice when a patient is frustrated, confused, or repeating themselves
+- Efficient — you do not ask questions that are clearly irrelevant to what the patient described
+- Human — you acknowledge what the patient said before asking your next question
+- Honest — you never pretend to know something you don't
 
-You do NOT make diagnoses. You do NOT suggest diseases. You do NOT give medical advice.
-Diagnosis is handled by a separate machine learning model downstream.
+HOW YOU CONDUCT THE CONSULTATION:
+1. Listen carefully to what the patient described
+2. Acknowledge their specific complaint — name it back to them
+3. Ask ONE focused follow-up question that is directly relevant to their complaint
+4. If the patient repeats themselves or seems frustrated, acknowledge it explicitly
+   and either move toward a conclusion or ask one final clarifying question
+5. Never ask the same question twice
+6. Never ask about symptoms completely unrelated to what the patient described
+   (e.g. do not ask about blood in sputum for a patient with leg cramps)
+7. If you have enough information (3+ confirmed symptoms OR the patient has
+   clearly expressed what is wrong), move to action: ready
 
-SYMPTOM VOCABULARY: You must map every symptom to the closest matching token from this list:
+DETECTING FRUSTRATION:
+A patient is frustrated when they:
+- Repeat their original complaint ("all I feel is...", "I already said...", "just the...")
+- Give single-word answers for several turns in a row
+- Say "no" to multiple questions in a row
+- Express exasperation in any form
+
+When you detect frustration:
+- Acknowledge it warmly: "I hear you — let me focus on what you've told me."
+- Do not ask another long list of questions
+- Work with what you have and move toward action: ready
+
+HANDLING SEVERITY AND QUALITATIVE STATEMENTS:
+Patients often describe intensity, frequency, or quality rather than naming symptoms.
+These are valid and useful responses. Do not treat them as unrecognised input.
+
+Examples and how to handle them:
+- "severe enough to wake me up" → severity: high for the current symptom.
+  Record the current question's target_symptom as confirmed. Action: ask next or ready.
+- "it's not that bad" → severity: mild. Record as confirmed with mild qualifier.
+- "comes and goes" → intermittent. Record the symptom as confirmed.
+- "only sometimes" → record as confirmed with low frequency.
+- "getting worse" → record as confirmed with escalating pattern.
+- "a little bit" → record as confirmed with mild qualifier.
+- "yes, very much so" → confirmed with high severity.
+- "just started today" → confirmed with acute onset.
+- "not really" / "kind of" / "a bit" → treat as confirmed (mild), not denied.
+
+When you receive a severity or qualitative statement:
+1. Identify which symptom the PREVIOUS question was asking about
+   (look at your last ask action's target_symptom)
+2. Treat the statement as a YES for that symptom, add it to newly_confirmed
+3. Return action: ask for the next question OR action: ready if enough is known
+
+CRITICAL: Never return action: extract with empty confirmed_symptoms for a severity
+statement. Never ask the user to repeat or clarify a severity statement.
+
+SYMPTOM VOCABULARY:
+Map what the patient says to the closest token from this list.
+Use clinical judgment — "leg cramps" maps to "cramps", "tired" maps to "fatigue":
 {symptom_vocabulary}
 
-RESPONSE FORMAT: Always respond with valid JSON only. No prose. No markdown. No explanation outside the JSON.
+RESPONSE FORMAT — valid JSON only, no prose outside the JSON:
 
-For symptom extraction, use this format:
+For follow-up questions:
+{{
+  "action": "ask",
+  "question": "Your warm, natural follow-up question — one sentence",
+  "target_symptom": "dataset_token_this_probes",
+  "acknowledgement": "Brief acknowledgement of what they said (1 sentence, optional)",
+  "reasoning": "Why this question is relevant to their complaint",
+  "newly_confirmed": ["any symptoms confirmed or implied by the user's last message"],
+  "newly_denied": []
+}}
+
+For when enough is known:
+{{
+  "action": "ready",
+  "confirmed_symptoms": ["symptom_1", "symptom_2"],
+  "denied_symptoms": ["symptom_3"],
+  "summary": "One warm sentence summarising what the patient described",
+  "frustration_detected": false
+}}
+
+For extraction without a question:
 {{
   "action": "extract",
-  "confirmed_symptoms": ["symptom_token_1", "symptom_token_2"],
-  "denied_symptoms": ["symptom_token_3"],
-  "unmapped_complaints": ["any complaint you could not map to the vocabulary"],
+  "confirmed_symptoms": ["symptom_1"],
+  "denied_symptoms": [],
+  "unmapped_complaints": ["any phrase you could not map"],
   "needs_more_info": true
 }}
 
-For follow-up questions, use this format:
-{{
-  "action": "ask",
-  "question": "Your single natural follow-up question here",
-  "target_symptom": "the_symptom_token_this_question_probes",
-  "reasoning": "brief clinical reason why this question is next"
-}}
-
-For when enough symptoms are collected (minimum 3 confirmed symptoms), use:
-{{
-  "action": "ready",
-  "confirmed_symptoms": ["symptom_1", "symptom_2", "symptom_3"],
-  "denied_symptoms": ["symptom_5"],
-  "summary": "Brief plain English summary of what the user reported"
-}}
-
-RULES:
-- Never ask about a symptom already confirmed or denied in conversation history
-- Never ask more than one question at a time
-- Map colloquial terms to dataset tokens (e.g. "tummy ache" -> "stomach_pain", "tired" -> "fatigue")
-- If a symptom has no close match in the vocabulary, add it to unmapped_complaints
-- Minimum 3 confirmed symptoms before action: ready
-- Maximum 8 follow-up questions total per session
+CONVERSATION QUALITY RULES:
+- Never start two consecutive questions with the same word
+- Never use "Thank you for sharing that" more than once per session
+- Vary your acknowledgements: "I understand", "Got it", "That helps",
+  "I hear you", "That makes sense", "Noted"
+- Questions must feel like a real doctor asked them, not a survey form
+- Maximum 6 follow-up questions before action: ready regardless of confidence
+- If the patient has denied 4+ questions in a row, stop asking and use action: ready
+  with what you have — do not exhaust them
 """
 
 
@@ -139,24 +196,56 @@ def extract_symptoms_from_text(
     Returns:
         Parsed dict with action, symptoms, and next question if applicable.
     """
-    system = _LAYER1_SYSTEM_PROMPT.format(
+    system = LAYER1_SYSTEM_PROMPT.format(
         symptom_vocabulary=", ".join(DATASET_SYMPTOMS)
     )
+
+    # Detect frustration signals before calling Claude.
+    consecutive_denials = _count_consecutive_denials(denied_so_far, conversation_history)
+    user_repeated_complaint = _detect_complaint_repetition(user_message, conversation_history)
+
+    frustration_note = ""
+    if consecutive_denials >= 3:
+        frustration_note = (
+            f"\n⚠️ FRUSTRATION SIGNAL: Patient has denied {consecutive_denials} "
+            f"questions in a row. Do not ask more questions. Use action: ready."
+        )
+    elif user_repeated_complaint:
+        frustration_note = (
+            f"\n⚠️ FRUSTRATION SIGNAL: Patient is repeating their original complaint. "
+            f"Acknowledge it and use action: ready with confirmed symptoms so far."
+        )
+    elif questions_asked >= 5:
+        frustration_note = (
+            f"\n⚠️ WRAP UP: {questions_asked} questions asked. "
+            f"Use action: ready unless this message contains a critical new symptom."
+        )
 
     state_context = {
         "role": "user",
         "content": (
-            f"Current session state:\n"
-            f"- Confirmed symptoms so far: {confirmed_so_far}\n"
-            f"- Denied symptoms so far: {denied_so_far}\n"
-            f"- Follow-up questions asked: {questions_asked}/8\n"
-            f"- Force ready if questions_asked >= 7\n\n"
-            f'User just said: "{user_message}"\n\n'
-            f"What is your action?"
+            f"SESSION STATE:\n"
+            f"- Confirmed symptoms: {confirmed_so_far or 'none yet'}\n"
+            f"- Denied symptoms: {denied_so_far or 'none yet'}\n"
+            f"- Questions asked: {questions_asked}/6\n"
+            f"{frustration_note}\n\n"
+            f"PATIENT JUST SAID: \"{user_message}\"\n\n"
+            f"Respond with your JSON action."
         ),
     }
 
     messages = list(conversation_history) + [state_context]
+
+    # Warn if the last two assistant turns are identical — signals a history persistence bug.
+    if len(conversation_history) > 2:
+        last_two_assistant = [
+            m["content"] for m in conversation_history if m["role"] == "assistant"
+        ][-2:]
+        if len(last_two_assistant) == 2 and last_two_assistant[0] == last_two_assistant[1]:
+            logger.warning(
+                "DUPLICATE RESPONSE DETECTED — conversation history may not be "
+                "persisting correctly between turns. Session: %s", session_id
+            )
 
     raw = ""
     try:
@@ -203,3 +292,77 @@ def extract_symptoms_from_text(
     except Exception as exc:
         logger.error("Layer 1 API error: %s | session=%s", exc, session_id)
         raise
+
+
+def _count_consecutive_denials(
+    denied_so_far: list[str],
+    history: list[dict],
+) -> int:
+    """Count how many of the most recent user messages are denial responses.
+
+    Walks history in reverse order and counts consecutive user turns that
+    contain denial language. Stops counting as soon as a non-denial is found.
+    Used to detect patient frustration from repeated negative answers.
+
+    Args:
+        denied_so_far: Symptom tokens already recorded as denied (unused directly
+            but kept in the signature for future symptom-level analysis).
+        history: Conversation history as list of {role, content} dicts.
+
+    Returns:
+        Number of consecutive denial responses at the tail of user turns.
+    """
+    denial_words = {
+        "no", "nope", "nah", "not really", "i don't", "none",
+        "negative", "never", "i haven't", "not at all",
+    }
+    consecutive = 0
+    for msg in reversed(history):
+        if msg["role"] == "user":
+            text = msg["content"].lower().strip()
+            if any(d in text for d in denial_words) and len(text) < 30:
+                consecutive += 1
+            else:
+                break
+    return consecutive
+
+
+def _detect_complaint_repetition(
+    user_message: str,
+    history: list[dict],
+) -> bool:
+    """Detect if the user is restating their original complaint.
+
+    Checks for explicit repetition phrases ("all I feel is", "I already said",
+    etc.) and for high word-overlap between the current message and the very
+    first user message in history.
+
+    Args:
+        user_message: The current raw text from the user.
+        history: Conversation history as list of {role, content} dicts.
+
+    Returns:
+        True if the user appears to be repeating their original complaint.
+    """
+    repetition_phrases = [
+        "all i feel", "all i have", "i already said", "i told you",
+        "just the", "only my", "just my", "as i said", "like i said",
+        "nothing else", "that's all", "only what i said",
+    ]
+    normalized = user_message.lower().strip()
+    if any(phrase in normalized for phrase in repetition_phrases):
+        return True
+
+    # High word-overlap with the very first user message signals repetition.
+    first_user_msg = next(
+        (m["content"] for m in history if m["role"] == "user"), ""
+    )
+    if first_user_msg:
+        first_words = set(first_user_msg.lower().split())
+        current_words = set(normalized.split())
+        if len(first_words) > 0:
+            overlap = len(first_words & current_words) / len(first_words)
+            if overlap > 0.6:
+                return True
+
+    return False
