@@ -1,5 +1,7 @@
 """Pydantic schemas for direct (stateless) diagnosis requests and responses."""
 
+from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -18,7 +20,7 @@ class DiagnosisRequest(BaseModel):
 
 
 class DiagnosisResult(BaseModel):
-    """Structured result returned by the ML inference pipeline.
+    """Structured result returned by the ML inference pipeline (direct endpoint).
 
     Attributes:
         disease:      Predicted disease name.
@@ -31,6 +33,33 @@ class DiagnosisResult(BaseModel):
     confidence: float = Field(..., ge=0.0, le=1.0)
     description: str
     precautions: list[str]
+
+
+class LLMDiagnosisResult(BaseModel):
+    """Full diagnosis result returned by the three-layer hybrid pipeline.
+
+    Field names use the same names as DiagnosisResult where possible so the
+    frontend can access disease/confidence/precautions without changes.
+
+    Attributes:
+        disease:            Predicted disease name (None if inconclusive).
+        confidence:         Dampened display confidence <= 0.89 (None if inconclusive).
+        description:        Plain-English explanation from Layer 3.
+        precautions:        Actionable steps recommended by Layer 3.
+        is_plausible:       Whether Layer 3 accepted the Decision Tree prediction.
+        urgency:            Severity tier: "mild" | "moderate" | "urgent".
+        when_to_see_doctor: Specific guidance on when to seek care.
+        disclaimer:         Mandatory medical disclaimer text.
+    """
+
+    disease: Optional[str] = None
+    confidence: Optional[float] = None
+    description: str = ""
+    precautions: list[str] = []
+    is_plausible: bool = False
+    urgency: str = "moderate"
+    when_to_see_doctor: str = ""
+    disclaimer: str = ""
 
 
 class InconclusiveResponse(BaseModel):

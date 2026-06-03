@@ -5,7 +5,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
-from app.schemas.diagnosis import DiagnosisResult
+from app.schemas.diagnosis import LLMDiagnosisResult
 
 
 class ChatMessageRequest(BaseModel):
@@ -28,14 +28,16 @@ class ChatMessageResponse(BaseModel):
         state:              Current dialogue state after processing.
         bot_message:        Text to display to the user.
         confirmed_symptoms: Symptoms confirmed so far in this session.
-        diagnosis:          Populated only once a prediction has been made.
+        diagnosis:          Full LLM pipeline result (populated on DONE state).
+        response_type:      "question" | "diagnosis" | "inconclusive" | "error".
     """
 
     session_id: uuid.UUID
     state: str
     bot_message: str
     confirmed_symptoms: list[str]
-    diagnosis: Optional[DiagnosisResult] = None
+    diagnosis: Optional[LLMDiagnosisResult] = None
+    response_type: str = "question"
 
 
 class ChatSessionResponse(BaseModel):

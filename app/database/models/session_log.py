@@ -3,7 +3,7 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, Float, String
+from sqlalchemy import Boolean, DateTime, Float, Integer, String
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -15,17 +15,20 @@ class ChatSession(Base):
 
     Columns
     -------
-    id                 Primary key (UUID v4).
-    created_at         UTC timestamp of session creation.
-    state              Current dialogue state (one of the ``DialogueState`` enum values).
-    confirmed_symptoms JSON list of symptom strings the user confirmed.
-    asked_symptoms     JSON list of symptom strings that were presented to the user.
-    primary_symptom    The user's first reported symptom (used by symptom router).
-    followup_queue     Ordered list of remaining follow-up symptom tokens to ask.
-    denied_symptoms    JSON list of symptom strings the user explicitly denied.
-    predicted_disease  Disease name returned by the model (set in PREDICTING state).
-    confidence         Model confidence score in [0, 1] (set in PREDICTING state).
-    completed          True once the session has reached DONE state.
+    id                   Primary key (UUID v4).
+    created_at           UTC timestamp of session creation.
+    state                Current dialogue state (one of the DialogueState enum values).
+    confirmed_symptoms   JSON list of symptom strings the user confirmed.
+    asked_symptoms       JSON list of symptom strings that were presented to the user.
+    primary_symptom      The user's first reported symptom (used by symptom router).
+    followup_queue       Ordered list of remaining follow-up symptom tokens to ask.
+    denied_symptoms      JSON list of symptom strings the user explicitly denied.
+    conversation_history Full turn-by-turn dialogue as [{role, content}] (LLM pipeline).
+    questions_asked      Count of follow-up questions asked this session (LLM pipeline).
+    final_diagnosis      Full Layer 3 result JSON (LLM pipeline).
+    predicted_disease    Disease name returned by the model (set in PREDICTING state).
+    confidence           Model confidence score in [0, 1] (set in PREDICTING state).
+    completed            True once the session has reached DONE state.
     """
 
     __tablename__ = "chat_sessions"
@@ -69,6 +72,21 @@ class ChatSession(Base):
         JSON,
         nullable=True,
         default=list,
+    )
+    conversation_history: Mapped[list] = mapped_column(
+        JSON,
+        nullable=True,
+        default=list,
+    )
+    questions_asked: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    final_diagnosis: Mapped[dict | None] = mapped_column(
+        JSON,
+        nullable=True,
+        default=None,
     )
     predicted_disease: Mapped[str | None] = mapped_column(
         String(256),

@@ -1,14 +1,17 @@
 """HTTP routes for the multi-turn chat API.
 
-POST /api/v1/chat/message  — send a message, get a bot reply
-GET  /api/v1/chat/session/{session_id} — retrieve a session's full state
+POST /api/v1/chat/message           — send a message, get a bot reply
+GET  /api/v1/chat/session/{id}      — retrieve a session's full state
+GET  /api/v1/chat/health/llm        — temporary: verify ANTHROPIC_API_KEY is loaded
 """
 
 from __future__ import annotations
 
+import os
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.controllers.v1 import chat_controller
@@ -55,6 +58,29 @@ async def post_message(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
+
+
+@router.get(
+    "/health/llm",
+    include_in_schema=False,
+    summary="Temporary: verify ANTHROPIC_API_KEY is loaded in this container",
+)
+async def llm_health_check() -> JSONResponse:
+    """Confirm the Anthropic API key is accessible at runtime.
+
+    Reads from settings (the single source of truth) rather than os.getenv
+    so that .env-file-based local deployments and container env vars both work.
+    Remove this endpoint once deployment has been verified.
+    """
+    from app.core.config import settings
+    key = settings.anthropic_api_key
+    return JSONResponse(
+        {
+            "api_key_loaded": bool(key),
+            "api_key_prefix": (key[:10] + "...") if key else "NOT SET",
+            "model": settings.anthropic_model,
+        }
+    )
 
 
 @router.get(
