@@ -22,13 +22,13 @@ This module is the single entry point called by the chat controller for every
 user message once the FSM is in COLLECTING or CONFIRMING state.
 """
 
-import json
 import logging
 from typing import TYPE_CHECKING
 
 from anthropic import Anthropic
 
 from app.core.config import settings
+from app.core.json_utils import extract_json_from_response
 from app.core.llm_input_processor import extract_symptoms_from_text
 from app.core.llm_output_validator import MEDICAL_DISCLAIMER, validate_and_explain_diagnosis
 from app.services.predictor_service import predict_disease
@@ -316,6 +316,7 @@ async def _run_prediction(
         confirmed_symptoms=confirmed,
         denied_symptoms=denied,
         conversation_summary=summary,
+        session_id=session_id,
     )
     session.state = "DONE"
     session.completed = True
@@ -378,6 +379,7 @@ async def _llm_web_search_fallback(
     confirmed_symptoms: list[str],
     denied_symptoms: list[str],
     conversation_summary: str,
+    session_id: str = "",
 ) -> dict:
     """Call Claude with web search when the Decision Tree cannot handle the symptom cluster.
 
@@ -390,6 +392,7 @@ async def _llm_web_search_fallback(
         confirmed_symptoms: Symptom tokens the user confirmed.
         denied_symptoms: Symptom tokens the user denied.
         conversation_summary: Plain-English summary of the consultation.
+        session_id: Optional session identifier for log correlation.
 
     Returns:
         Diagnosis dict compatible with the Layer 3 output schema, with
@@ -453,12 +456,15 @@ async def _llm_web_search_fallback(
             return _inconclusive_fallback()
 
         raw = text_blocks[-1].text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-
-        parsed = json.loads(raw.strip())
+        try:
+            parsed = extract_json_from_response(raw)
+        except ValueError as exc:
+            logger.error(
+                "LLM web search fallback JSON extraction failed | error=%s | "
+                "raw_length=%d | raw_preview=%s | session=%s",
+                exc, len(raw), raw[:300], session_id,
+            )
+            return _inconclusive_fallback()
         parsed["disclaimer"] = MEDICAL_DISCLAIMER
         parsed["source"] = "web_search"
         # Enforce the 0.89 confidence ceiling.
@@ -466,11 +472,10 @@ async def _llm_web_search_fallback(
             parsed["display_confidence"] = 0.89
         return parsed
 
-    except json.JSONDecodeError as exc:
-        logger.error("LLM web search fallback JSON parse error: %s | raw=%s", exc, raw)
-        return _inconclusive_fallback()
     except Exception as exc:
-        logger.error("LLM web search fallback failed: %s", exc)
+        logger.error(
+            "LLM web search fallback API error: %s | session=%s", exc, session_id
+        )
         return _inconclusive_fallback()
 
 

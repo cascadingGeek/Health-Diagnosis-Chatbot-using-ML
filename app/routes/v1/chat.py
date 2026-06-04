@@ -11,7 +11,7 @@ import os
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.controllers.v1 import chat_controller
@@ -53,6 +53,54 @@ async def post_message(
     """
     try:
         return await chat_controller.handle_message(body, db, registry)
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+
+@router.post(
+    "/stream",
+    response_class=StreamingResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Stream a chat message response via Server-Sent Events",
+)
+async def stream_message(
+    body: ChatMessageRequest,
+    db: AsyncSession = Depends(get_async_session),
+    registry=Depends(_get_registry),
+) -> StreamingResponse:
+    """Stream bot response events as they are produced by the pipeline.
+
+    Returns a ``text/event-stream`` response.  Events arrive in this order:
+
+    * ``thinking`` — pipeline stage started (show loading indicator).
+    * ``question`` — bot has a follow-up question to display.
+    * ``token``    — one streaming token from Claude (append to message bubble).
+    * ``diagnosis``— complete diagnosis object (final turn only).
+    * ``error``    — something went wrong.
+    * ``done``     — stream is complete; close the EventSource connection.
+
+    Each event has the wire format::
+
+        event: <type>\\n
+        data: <json>\\n
+        \\n
+
+    Args:
+        body:     Validated request body.
+        db:       Injected async database session.
+        registry: Injected model registry from app state.
+
+    Returns:
+        ``StreamingResponse`` with ``Content-Type: text/event-stream``.
+
+    Raises:
+        404: If a ``session_id`` is provided but does not exist.
+    """
+    try:
+        return await chat_controller.handle_stream_message(body, db, registry)
     except SessionNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

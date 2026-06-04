@@ -13,12 +13,12 @@ It can flag a prediction as implausible and return an inconclusive response inst
 The Decision Tree prediction is treated as ground truth unless clearly incoherent.
 """
 
-import json
 import logging
 
 from anthropic import Anthropic
 
 from app.core.config import settings
+from app.core.json_utils import extract_json_from_response
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ MEDICAL_DISCLAIMER = (
     "before making any health decisions, especially if your symptoms are severe or worsening."
 )
 
-_LAYER3_SYSTEM_PROMPT = """You are a medical response generator working as the final layer
+LAYER3_SYSTEM_PROMPT = """You are a medical response generator working as the final layer
 of a diagnostic pipeline. A machine learning Decision Tree classifier has already made
 a diagnosis prediction. Your job is to validate and explain it — not to override it.
 
@@ -117,7 +117,7 @@ def validate_and_explain_diagnosis(
     Returns:
         Parsed response dict ready to send to the frontend.
     """
-    display_confidence = _dampen_confidence(raw_confidence)
+    display_confidence = dampen_confidence(raw_confidence)
 
     user_message = (
         f"Decision Tree prediction: {predicted_disease}\n"
@@ -143,7 +143,7 @@ def validate_and_explain_diagnosis(
         response = _client.messages.create(
             model=settings.anthropic_model,
             max_tokens=1024,
-            system=_LAYER3_SYSTEM_PROMPT.format(disclaimer=MEDICAL_DISCLAIMER),
+            system=LAYER3_SYSTEM_PROMPT.format(disclaimer=MEDICAL_DISCLAIMER),
             messages=[{"role": "user", "content": user_message}],
             tools=tools,
         )
@@ -167,12 +167,14 @@ def validate_and_explain_diagnosis(
             return _inconclusive_fallback()
 
         raw = text_blocks[-1].text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-
-        parsed = json.loads(raw.strip())
+        try:
+            parsed = extract_json_from_response(raw)
+        except ValueError as exc:
+            logger.error(
+                "Layer 3 JSON extraction failed | error=%s | raw_preview=%s | session=%s",
+                exc, raw[:300], session_id,
+            )
+            return _inconclusive_fallback()
 
         # Safety: disclaimer must always be present.
         if not parsed.get("disclaimer"):
@@ -191,12 +193,6 @@ def validate_and_explain_diagnosis(
             session_id,
         )
         return parsed
-
-    except json.JSONDecodeError as exc:
-        logger.error(
-            "Layer 3 JSON parse error: %s | raw=%s | session=%s", exc, raw, session_id
-        )
-        return _inconclusive_fallback()
     except Exception as exc:
         logger.error("Layer 3 API error: %s | session=%s", exc, session_id)
         # If web_search tool is unsupported by this SDK version, retry without it.
@@ -233,7 +229,7 @@ def _validate_without_web_search(
         response = _client.messages.create(
             model=settings.anthropic_model,
             max_tokens=1024,
-            system=_LAYER3_SYSTEM_PROMPT.format(disclaimer=MEDICAL_DISCLAIMER),
+            system=LAYER3_SYSTEM_PROMPT.format(disclaimer=MEDICAL_DISCLAIMER),
             messages=[{"role": "user", "content": user_message}],
         )
 
@@ -251,12 +247,15 @@ def _validate_without_web_search(
             return _inconclusive_fallback()
 
         raw = text_blocks[-1].text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-
-        parsed = json.loads(raw.strip())
+        try:
+            parsed = extract_json_from_response(raw)
+        except ValueError as exc:
+            logger.error(
+                "Layer 3 (no-web-search) JSON extraction failed | error=%s | "
+                "raw_preview=%s | session=%s",
+                exc, raw[:300], session_id,
+            )
+            return _inconclusive_fallback()
         if not parsed.get("disclaimer"):
             parsed["disclaimer"] = MEDICAL_DISCLAIMER
         if parsed.get("display_confidence") and parsed["display_confidence"] > 0.87:
@@ -272,7 +271,7 @@ def _validate_without_web_search(
         return _inconclusive_fallback()
 
 
-def _dampen_confidence(raw: float) -> float:
+def dampen_confidence(raw: float) -> float:
     """Transform raw Decision Tree probability to display confidence.
 
     Decision Trees trained on the Kaggle synthetic dataset memorise training

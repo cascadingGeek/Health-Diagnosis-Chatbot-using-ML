@@ -84,21 +84,31 @@ def build_vector(
 ) -> np.ndarray:
     """Build a binary feature vector from a list of confirmed symptoms.
 
+    Unknown symptom tokens (those that cannot be fuzzy-matched to the training
+    vocabulary above the confidence threshold) are logged and skipped rather
+    than raising an exception.  This allows the Decision Tree to still attempt
+    a prediction on the remaining valid symptoms.  If ALL symptoms are skipped
+    the caller receives an all-zero vector, which will produce a low-confidence
+    prediction and route to the LLM web-search fallback.
+
     Args:
         collected_symptoms: Symptom strings confirmed during dialogue.
         symptom_list:       Ordered canonical symptom list (length 132).
 
     Returns:
         ``np.ndarray`` of shape ``(1, len(symptom_list))`` with ``1.0`` at
-        each position corresponding to a confirmed symptom.
-
-    Raises:
-        FeatureContractError: If any symptom cannot be matched.
+        each position corresponding to a successfully matched symptom.
     """
     vector = np.zeros((1, len(symptom_list)), dtype=np.float64)
 
     for raw in collected_symptoms:
-        canonical = _resolve_symptom(raw, symptom_list)
+        try:
+            canonical = _resolve_symptom(raw, symptom_list)
+        except FeatureContractError:
+            logger.warning(
+                "Skipping unknown symptom token '%s' — not in training vocabulary", raw
+            )
+            continue
         idx = symptom_list.index(canonical)
         vector[0, idx] = 1.0
 

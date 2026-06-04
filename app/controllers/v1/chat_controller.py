@@ -7,9 +7,11 @@ No SQLAlchemy or HTTP primitives leak beyond this layer.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ml.model_registry import ModelRegistry
@@ -17,6 +19,7 @@ from app.schemas.chat import ChatMessageRequest, ChatMessageResponse, ChatSessio
 from app.schemas.diagnosis import LLMDiagnosisResult
 from app.services import session_service
 from app.services.llm_orchestrator import process_message as orchestrate
+from app.services.streaming_orchestrator import stream_message
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +102,82 @@ async def handle_message(
         confirmed_symptoms=list(chat_session.confirmed_symptoms or []),
         diagnosis=llm_diagnosis,
         response_type=result["response_type"],
+    )
+
+
+async def handle_stream_message(
+    request: ChatMessageRequest,
+    db: AsyncSession,
+    registry: ModelRegistry,  # noqa: ARG001 — kept for DI compatibility
+) -> StreamingResponse:
+    """Process one user message as an SSE stream.
+
+    Creates a new session when ``request.session_id`` is ``None``.
+    The GREETING state is handled here (returns welcome message without calling
+    the LLM).  All other states are delegated to the streaming orchestrator.
+
+    The returned ``StreamingResponse`` generator runs while the HTTP connection
+    is open.  FastAPI's ``yield``-dependency lifecycle keeps the ``db`` session
+    valid until the generator is exhausted.
+
+    Args:
+        request:  Validated ``ChatMessageRequest``.
+        db:       Async database session (provided by FastAPI dependency).
+        registry: Loaded ``ModelRegistry`` (kept for interface compatibility).
+
+    Returns:
+        ``StreamingResponse`` with ``Content-Type: text/event-stream``.
+    """
+    _SSE_HEADERS = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+    # ── Obtain or create session ──────────────────────────────────────────────
+    if request.session_id is None:
+        chat_session = await session_service.create_session(db)
+        logger.info(
+            "New streaming session created",
+            extra={"session_id": str(chat_session.id)},
+        )
+    else:
+        chat_session = await session_service.get_session(db, request.session_id)
+
+    # ── GREETING state: emit welcome without calling the LLM ─────────────────
+    if chat_session.state == "GREETING":
+        chat_session.state = "COLLECTING"
+        await session_service.save_session(db, chat_session)
+        session_id_str = str(chat_session.id)
+
+        async def _greeting_stream() -> StreamingResponse:
+            welcome = (
+                "Hello! I'm Dr. Melvis, your AI health assistant. "
+                "I'll ask you a few questions about your symptoms to help identify "
+                "a possible condition.\n\n"
+                "Please describe how you are feeling in your own words — "
+                "a full sentence is fine."
+            )
+            yield f"event: question\ndata: {json.dumps({'message': welcome})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'session_id': session_id_str})}\n\n"
+
+        return StreamingResponse(
+            _greeting_stream(),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
+    # ── All other states: run the streaming pipeline ──────────────────────────
+    session_id_str = str(chat_session.id)
+
+    async def _event_stream():
+        async for event in stream_message(chat_session, request.message, db):
+            yield f"event: {event['type']}\ndata: {json.dumps(event['data'])}\n\n"
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
     )
 
 

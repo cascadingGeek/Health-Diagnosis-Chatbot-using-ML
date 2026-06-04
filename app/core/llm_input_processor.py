@@ -11,12 +11,12 @@ This layer does NOT make diagnostic predictions.
 That is exclusively the responsibility of the Decision Tree (Layer 2).
 """
 
-import json
 import logging
 
 from anthropic import Anthropic
 
 from app.core.config import settings
+from app.core.json_utils import extract_json_from_response
 
 logger = logging.getLogger(__name__)
 
@@ -266,29 +266,25 @@ def extract_symptoms_from_text(
         )
 
         raw = response.content[0].text.strip()
-        # Strip markdown fences if present.
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-
-        parsed = json.loads(raw.strip())
+        try:
+            parsed = extract_json_from_response(raw)
+        except ValueError as exc:
+            logger.error(
+                "Layer 1 JSON extraction failed | error=%s | raw_preview=%s | session=%s",
+                exc, raw[:300], session_id,
+            )
+            return {
+                "action": "ask",
+                "question": (
+                    "I want to make sure I understand you correctly. "
+                    "Could you describe your main symptom again?"
+                ),
+                "target_symptom": None,
+                "reasoning": "JSON extraction fallback",
+            }
         logger.info("Layer 1 action: %s | session=%s", parsed.get("action"), session_id)
         return parsed
 
-    except json.JSONDecodeError as exc:
-        logger.error(
-            "Layer 1 JSON parse error: %s | raw=%s | session=%s", exc, raw, session_id
-        )
-        return {
-            "action": "ask",
-            "question": (
-                "Could you describe your main symptom again? "
-                "I want to make sure I understand correctly."
-            ),
-            "target_symptom": None,
-            "reasoning": "JSON parse fallback",
-        }
     except Exception as exc:
         logger.error("Layer 1 API error: %s | session=%s", exc, session_id)
         raise
